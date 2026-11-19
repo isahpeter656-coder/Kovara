@@ -46,6 +46,34 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol};
 
+// ── Identifier registry ──────────────────────────────────────────────────────
+
+/// Country identifiers recognised by this contract.
+///
+/// The list is intentionally identical to `PriceVault`'s `registry::COUNTRY_CODES`
+/// so that a country accepted for price submissions is also accepted for index
+/// writes, and nothing else is.  Keeping the two copies in sync is the
+/// contract-upgrade responsibility; they are not shared through a crate
+/// dependency so that each contract can be deployed and versioned independently.
+pub mod registry {
+    use soroban_sdk::{Env, Symbol};
+
+    /// Supported ISO 3166-1 alpha-2 country codes — mirrors `PriceVault`.
+    pub const COUNTRY_CODES: &[&str] = &[
+        "US", "GB", "NG", "KE", "IN", "BR", "DE", "FR", "JP", "CN", "ZA", "GH", "EG", "TZ",
+        "UG", "ET", "PH", "ID", "MX", "AR",
+    ];
+
+    /// Whether `country` is a supported ISO 3166-1 alpha-2 identifier.
+    ///
+    /// Pure: no storage, no ledger access.
+    pub fn is_supported_country(env: &Env, country: &Symbol) -> bool {
+        COUNTRY_CODES
+            .iter()
+            .any(|code| &Symbol::new(env, code) == country)
+    }
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -73,6 +101,10 @@ pub enum Error {
     AuthorityAlreadyConfigured = 8,
     /// No daily value exists for `(country, date)` to correct.
     NotFound = 9,
+    /// The country identifier is not in the supported ISO 3166-1 alpha-2
+    /// registry.  Matches the same guard `PriceVault` applies before any
+    /// write or read.
+    InvalidCountry = 10,
 }
 
 #[contracttype]
@@ -98,6 +130,7 @@ impl KovaraIndex {
     /// a published value.
     ///
     /// # Errors
+    /// * [`Error::InvalidCountry`] — `country` is not in the supported registry.
     /// * [`Error::InvalidDate`] — `date == 0`.
     /// * [`Error::DuplicateWrite`] — this country/date already has a value.
     pub fn set_daily_index(
@@ -108,6 +141,9 @@ impl KovaraIndex {
         value: i128,
     ) -> Result<(), Error> {
         // 1. Pure checks, before auth and before any write.
+        if !registry::is_supported_country(&env, &country) {
+            return Err(Error::InvalidCountry);
+        }
         if date == 0 {
             return Err(Error::InvalidDate);
         }
@@ -123,7 +159,13 @@ impl KovaraIndex {
     }
 
     /// Read a stored daily index value, if present.
+    ///
+    /// Returns `None` for an unsupported `country` identifier, an unknown
+    /// `(country, date)` pair, or a country that has never had a value written.
     pub fn get_daily_index(env: Env, country: Symbol, date: u64) -> Option<i128> {
+        if !registry::is_supported_country(&env, &country) {
+            return None;
+        }
         env.storage()
             .persistent()
             .get(&DataKey::DailyIndex(country, date))
@@ -145,10 +187,12 @@ impl KovaraIndex {
     /// The window a stored daily index value came from, if it was written
     /// through [`Self::set_daily_index_windowed`].
     ///
-    /// `None` for a value written through [`Self::set_daily_index`], which
-    /// carries no window at all. That distinction is the point: an index entry
-    /// with no window cannot be re-checked for staleness later.
+    /// `None` for an unsupported `country` identifier, a value written through
+    /// [`Self::set_daily_index`] (which carries no window), or an unknown key.
     pub fn get_daily_window(env: Env, country: Symbol, date: u64) -> Option<(u64, u64)> {
+        if !registry::is_supported_country(&env, &country) {
+            return None;
+        }
         env.storage()
             .persistent()
             .get(&DataKey::DailyWindow(country, date))
@@ -169,6 +213,7 @@ impl KovaraIndex {
     /// write, so the existing value and window stay byte-for-byte unchanged.
     ///
     /// # Errors
+    /// * [`Error::InvalidCountry`] — `country` is not in the supported registry.
     /// * [`Error::InvalidDate`] — `date == 0`.
     /// * [`Error::InvalidWindow`] — `valid_until <= valid_from`.
     /// * [`Error::NotYetValid`] — `query_ts < valid_from`.
@@ -185,6 +230,9 @@ impl KovaraIndex {
         query_ts: u64,
     ) -> Result<(), Error> {
         // 1. Pure predicates over the arguments, before auth and before storage.
+        if !registry::is_supported_country(&env, &country) {
+            return Err(Error::InvalidCountry);
+        }
         if date == 0 {
             return Err(Error::InvalidDate);
         }
@@ -220,16 +268,19 @@ impl KovaraIndex {
     /// `query_ts`.
     ///
     /// The read-side gate, for a caller that wants the same freshness
-    /// guarantee the write side enforced. `None` covers three cases the caller
+    /// guarantee the write side enforced. `None` covers four cases the caller
     /// can distinguish with [`Self::get_daily_window`] and [`Self::get_daily_index`]:
-    /// no entry, an entry written without a window, and an entry whose window
-    /// has expired.
+    /// unsupported country, no entry, an entry written without a window, and an
+    /// entry whose window has expired.
     pub fn get_fresh_daily_index(
         env: Env,
         country: Symbol,
         date: u64,
         query_ts: u64,
     ) -> Option<i128> {
+        if !registry::is_supported_country(&env, &country) {
+            return None;
+        }
         let (valid_from, valid_until) = Self::get_daily_window(env.clone(), country.clone(), date)?;
         if !Self::is_fresh(valid_from, valid_until, query_ts) {
             return None;
@@ -276,6 +327,7 @@ impl KovaraIndex {
     /// top without changing this authorization boundary.
     ///
     /// # Errors
+    /// * [`Error::InvalidCountry`] — `country` is not in the supported registry.
     /// * [`Error::InvalidDate`] — `date == 0`.
     /// * [`Error::CorrectionAuthorityNotConfigured`] — no authority was set.
     /// * [`Error::Unauthorized`] — `authority` is not the configured one.
@@ -288,6 +340,9 @@ impl KovaraIndex {
         value: i128,
     ) -> Result<(), Error> {
         // 1. Pure checks, before auth and before any write.
+        if !registry::is_supported_country(&env, &country) {
+            return Err(Error::InvalidCountry);
+        }
         if date == 0 {
             return Err(Error::InvalidDate);
         }
